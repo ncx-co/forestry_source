@@ -38,7 +38,7 @@ popList[[1]] <- rtruncnorm(n = 100000,
 sampleSize <- (1.78 * (standSim$std / standSim$meanBA) / 0.1 ) ^ 2
 
 ###so we sample 15 plots
-#The standard sample size equation tells us that we want 13 plots to
+#The standard sample size equation tells us that we want 15 plots to
 #reach our target of +/- 10% at 90%
 cruise_stand <- function(i) {
   temp <- sample(popList[[1]], size = 15, replace = F)
