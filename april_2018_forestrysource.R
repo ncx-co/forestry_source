@@ -39,9 +39,8 @@ population <- rtruncnorm(
 # sampleSize <- t * (std / mean) / allowableE
 sampleSize <- (1.78 * (standSim$std / standSim$meanBA) / 0.1 ) ^ 2
 
-###so we sample 15 plots
-#The standard sample size equation tells us that we want 15 plots to
-#reach our target of +/- 10% at 90%
+# The standard sample size equation tells us that we want 15 plots to
+# reach our target of +/- 10% at 90%.
 cruise_stand <- function(i) {
   temp <- sample(population, size = 15, replace = F)
   meantemp <- mean(temp)
@@ -114,7 +113,6 @@ mean(cruise20Pass$overlapPct)
 # of the first cruise
 
 # Regardless, both cruises are valid representations of the population
-#####
 
 compHigh <- cruise20$meantemp[2] + cruise20$CI[2]
 compLow <- cruise20$meantemp[2] - cruise20$CI[2]
