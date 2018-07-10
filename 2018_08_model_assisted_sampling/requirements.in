@@ -1,0 +1,12 @@
+pip-tools==2.0.2
+
+numpy==1.14.5
+pandas==0.23.3
+scipy==1.1.0
+plotly==3.0.0
+
+fiona==1.7.12
+rasterio==0.36.0
+shapely==1.6.4
+
+jupyter==1.0.0
