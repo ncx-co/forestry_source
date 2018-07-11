@@ -7,7 +7,7 @@ To view the notebook, just click this link:
 
 Additional documentation is contained in the jupyter notebook.
 
-#### Installation and Initialization
+## Installation and Initialization
 
 If you want to, you can run this notebook on your own computer.
 
