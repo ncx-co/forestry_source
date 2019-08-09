@@ -1,0 +1,2162 @@
+---
+title: "2019 StanCon Poster Analysis"
+author: "Nathan Rutenbeck, Silviaterra LLC"
+date: "8/8/2019"
+output: html_document
+---
+
+```{r setup, include = F}
+library(rstan)
+library(sf)
+library(tidyverse)
+library(tidybayes)
+library(bayesplot)
+library(loo)
+library(glue)
+library(vroom)
+library(knitr)
+library(invgamma)
+
+opts_chunk$set(
+  echo = FALSE,
+  include = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	error = FALSE,
+	cache = TRUE,
+	dev = 'png',
+	fig.width = 7,
+	fig.height = 10,
+	comment = NA
+  )
+
+options(mc.cores = parallel::detectCores())
+load(url("https://silviaterra-biometrics-public.s3.amazonaws.com/stancon_2019_poster_data.Rda"))
+
+```
+
+```{r stan_data}
+
+J <- nrow(fit_stands)
+K <- nrow(test_stands)
+
+# response
+
+y_t <- fit_training$baph
+y_h <- test_training$baph
+
+y_t_scaled <- (y_t - mean(y_t)) / sd(y_t)
+y_h_scaled <- (y_h - mean(y_t)) / sd(y_t) # use the same scaling as y_t
+
+N <- length(y_t)
+M <- length(y_h)
+
+# stand-level predictors
+
+w_t <- fit_stands$sample_weight 
+w_t_scaled <- (w_t - mean(w_t)) / sd(w_t)
+w_h <- test_stands$sample_weight
+w_h_scaled <- (w_h - mean(w_t)) / sd(w_t)
+
+jj <- fit_training$j
+kk <- test_training$k
+
+U_t <- matrix(c(rep(1, J), w_t_scaled), ncol = 2)
+U_h <- matrix(c(rep(1, K), w_h_scaled), ncol = 2)
+
+R <- ncol(U_t)
+
+# population predictors
+
+X_t <- fit_training %>%
+  select(contains("pca")) %>%
+  as.matrix()
+
+X_h <- test_training %>%
+  select(contains("pca")) %>%
+  as.matrix()
+
+P <- ncol(X_t)
+
+# Stan controls
+
+n_chains <- 4
+n_warmup <- 1e3
+n_iter <- 4e3
+```
+
+```{r helper_functions}
+
+extract_test_fit <- function(fit, y_train = y_t, fit_name) {
+  fit %>%
+    spread_draws(y_h_new[m]) %>%
+    left_join(test_training, by = "m") %>%
+    ungroup() %>%
+    transmute(
+      anon_id, plot_id,
+      model = fit_name,
+      .chain, .iteration, .draw,
+      pred = y_h_new * sd(y_train) + mean(y_train),
+      obs = baph,
+      error = obs -pred
+    )
+}
+
+extract_training_fit <- function(fit, y_train = y_t, fit_name) {
+  fit %>%
+    spread_draws(y_t_new[n]) %>%
+    left_join(fit_training, by = "n") %>%
+    ungroup() %>%
+    transmute(
+      anon_id, plot_id,
+      model = fit_name,
+      .chain, .iteration, .draw,
+      pred = y_t_new * sd(y_train) + mean(y_train),
+      obs = baph,
+      error = obs -pred
+    )
+}
+
+summarize_preds <- function(
+  pw_preds,
+  type = c("training", "test"),
+  upper_q = 0.95,
+  lower_q = 0.05
+) {
+  type <- match.arg(type)
+  
+  pw_preds %>%
+    group_by(anon_id, plot_id, model, obs) %>%
+    summarize(
+      med = median(pred),
+      type = type,
+      upper = quantile(pred, upper_q),
+      lower = quantile(pred, lower_q)
+    )
+
+}
+
+summarize_error <- function(
+  pw_preds,
+  group,
+  type = c("training", "test"),
+  upper_q = 0.95,
+  lower_q = 0.05
+) {
+  type <- match.arg(type)
+  
+  group <- enquo(group)
+  
+  pw_preds %>%
+    group_by(model, !!!group, .draw) %>%
+    summarize(
+      RMSE = sqrt(mean(error ^2)),
+      MAE = mean(abs(error))
+    ) %>%
+    gather(key = measure, value = stat, RMSE, MAE) %>%
+    group_by(model, !!!group, measure) %>%
+    summarize(
+      type = type,
+      med = median(stat),
+      upper = quantile(stat, upper_q),
+      lower = quantile(stat, lower_q)
+    )
+
+}
+
+plot_stand_fits <- function(
+  pw_summary,
+  fit_name,
+  type = c("training", "test")
+) {
+  type = match.arg(type)
+  lims <- c(0, max(pw_summary$obs) + 10)
+  
+  ggplot(pw_summary) +
+    geom_point(aes(x = obs, y = med), size = 0.2) +
+    geom_errorbar(
+      aes(x = obs, ymin = lower, ymax = upper), alpha = 0.1
+    ) +
+    geom_abline() +
+    theme_bw() +
+    xlab("observation") +
+    ylab("prediction") +
+    xlim(lims) +
+    ylim(lims) +
+    facet_wrap( ~ anon_id) +
+    ggtitle(glue("{fit_name} {type} fit"))
+}
+
+```
+
+```{stan design_model, output.var = "design_model"}
+
+data {
+  int <lower=0> N;
+  int <lower=0> M;
+  real y_t[N];
+  real y_h[M];
+  int <lower=0> J;
+  int <lower=0> K;
+  int <lower=0> R;
+  matrix[J, R] U_t;
+  matrix[K, R] U_h;
+  int <lower=0> jj[N];
+  int <lower=0> kk[M];
+  int prior_only;
+}
+
+parameters {
+
+  // -------------- //
+  // global effects //
+  // -------------- //
+  
+  // gamma
+  // vector[R] mu_gamma;
+  // vector[R] gamma_raw;
+  //vector<lower=0>[R] tau_gamma;
+  // cholesky_factor_corr[R] L;
+  vector[R] gamma;
+
+  // sigma
+  real<lower=0> alpha_sigma;
+  real<lower=0> beta_sigma;
+
+  // ------------- //
+  // stand-level effects //
+  // ------------- //
+  
+  // alpha
+  vector[J] alpha_tilde;
+  real<lower=0> tau_alpha;
+  
+  //sigma
+  real<lower=0> sigma[J];
+  
+  // ------------------ //
+  // population effects //
+  // ------------------ //
+
+}
+
+transformed parameters {
+  vector[J] alpha;
+  real mu_n[N];
+  real sigma_n[N];
+  // vector[R] gamma;
+  
+  // gamma = mu_gamma + tau_gamma .* (L * gamma_raw);
+  
+  alpha = U_t * gamma + tau_alpha * alpha_tilde;
+
+  for (n in 1:N) {
+    mu_n[n] = alpha[jj[n]];
+    sigma_n[n] = sigma[jj[n]];
+  }
+}
+
+model {
+
+  // ------------- //
+  // global priors //
+  // ------------- //
+  
+  // gamma
+  //target += normal_lpdf(mu_gamma | 0, 1);
+  //target += normal_lpdf(gamma_raw | 0, 1);
+  //target += inv_gamma_lpdf(tau_gamma | 5, 1);
+  //target += lkj_corr_cholesky_lpdf(L | 4);
+  
+  target += normal_lpdf(gamma | 0, 0.1);
+  
+  // sigma
+  target += normal_lpdf(alpha_sigma | 10, 1);
+  target += normal_lpdf(beta_sigma | 8, 1);
+  
+  // ------------ //
+  // stand priors //
+  // ------------ //
+  
+  // alpha
+  target += normal_lpdf(tau_alpha | 0, 1);
+  target += normal_lpdf(alpha_tilde | 0, 1);
+  
+  // sigma
+  target += inv_gamma_lpdf(sigma | alpha_sigma, beta_sigma);
+  
+  // ----------------- //
+  // population priors //
+  // ----------------- //
+
+  // ---------- //
+  // likelihood //
+  // ---------- //
+  if(!prior_only) {
+    target += normal_lpdf(y_t | mu_n, sigma_n);
+  }
+  
+}
+
+generated quantities {
+  // training set
+  real y_t_new[N];
+  vector[N] log_lik_t;
+  
+  // test set
+  real alpha_new[K];
+  real sigma_new[K];
+  vector[M] mu_m;
+  vector[M] sigma_m;
+  vector[M] y_h_new;
+  vector[M] log_lik_h;
+  
+  for (k in 1:K) {
+    alpha_new[k] = normal_rng(U_h[k] * gamma, tau_alpha);
+    sigma_new[k] = inv_gamma_rng(alpha_sigma, beta_sigma);
+  }
+  
+  for (m in 1:M) {
+    mu_m[m] = alpha_new[kk[m]];
+    sigma_m[m] = sigma_new[kk[m]];
+    y_h_new[m] = normal_rng(mu_m[m], sigma_m[m]);
+    log_lik_h[m] = normal_lpdf(y_h[m] | mu_m[m], sigma_m[m]);
+  }
+  
+  for (n in 1:N) {
+    y_t_new[n] = normal_rng(mu_n[n], sigma_n[n]);
+    log_lik_t[n] = normal_lpdf(y_t[n] | mu_n[n], sigma_n[n]);
+  }
+}
+
+```
+
+
+```{r design_prior, results="hide"}
+
+design_prior_data <- list(
+  N = N,
+  M = M,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  jj = jj,
+  J = J,
+  kk = kk,
+  K = K,
+  R = R,
+  U_t = U_t,
+  U_h = U_h,
+  prior_only = 1
+)
+
+design_prior <- sampling(
+  design_model,
+  data = design_prior_data,
+  chains = 1,
+  warmup = 1e3,
+  iter = 1500,
+  cores = 1
+)
+
+design_prior_preds <- tidybayes::spread_draws(design_prior, y_t_new[n])
+```
+
+```{r design_prior_plot}
+ggplot() +
+  geom_density(
+    data = design_prior_preds, aes(x = y_t_new, y = ..scaled.., group = .draw)
+    ) +
+  geom_density(aes(x = y_t_scaled, y = ..scaled..), color = "blue") +
+  ggtitle("Design Prior Predictive Density") +
+  theme_bw()
+
+```
+
+```{r design_fit, results = "hide"}
+
+design_data <- list(
+  N = N,
+  M = M,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  jj = jj,
+  J = J,
+  kk = kk,
+  K = K,
+  U_t = U_t,
+  U_h = U_h,
+  R = R,
+  prior_only = 0
+)
+
+
+design_fit <- sampling(
+  design_model,
+  data = design_data,
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  ),
+  chains = n_chains,
+  warmup = n_warmup,
+  iter = n_iter,
+  cores = n_chains
+)
+
+```
+
+```{r design_rhats, eval = FALSE}
+
+design_rhats <- rhat(
+  design_fit,
+  pars = c(
+    # glue("mu_gamma[{1:R}]"),
+    # glue("tau_gamma[{1:R}]"),
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    "alpha_sigma",
+    "beta_sigma",
+    glue("alpha[{1:J}]"),
+    glue("sigma[{1:J}]"),
+    "lp__"
+    )
+  )
+
+mcmc_rhat(design_rhats)
+
+```
+
+
+```{r design_post}
+
+design_post <- rstan::extract(
+  design_fit,
+  inc_warmup = FALSE,
+  permuted = FALSE
+  )
+
+design_nuts <- nuts_params(design_fit)
+```
+
+```{r design_diverge, eval = FALSE}
+mcmc_nuts_divergence(design_nuts, lp = log_posterior(design_fit))
+```
+
+```{r design_parcoord, eval = FALSE}
+mcmc_parcoord(
+  design_post,
+  np = design_nuts,
+  pars = c(
+    # glue("mu_gamma[{1:R}]"),
+    # glue("tau_gamma[{1:R}]"),
+    glue("gamma[{1:R}]"),
+    "tau_alpha"
+    # glue("alpha[{1:J}]"),
+    # glue("sigma[{1:J}]"),
+    # "lp__"
+  )
+) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r design_trace, eval = FALSE}
+
+design_trace <- bayesplot::mcmc_trace(
+  design_post, 
+  pars = c(    
+    # glue("mu_gamma[{1:R}]"),
+    # glue("tau_gamma[{1:R}]"),
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    "alpha_sigma",
+    "beta_sigma"
+    ),
+  facet_args = list(nrow = 3, labeller = label_parsed))
+
+
+design_trace + bayesplot::facet_text(size = 15)
+
+```
+
+```{r design_scatter, eval = FALSE}
+mcmc_scatter(
+  design_post,
+  pars = c("alpha[1]", "tau_alpha"),
+  transformations = list(tau_alpha = "log"),
+  np = design_nuts,
+  size = 1
+)
+
+mcmc_scatter(
+  design_post,
+  pars = c("gamma[1]", "gamma[2]"),
+  np = design_nuts,
+  size = 1
+)
+
+```
+
+```{r design_neff, eval = FALSE}
+
+design_neff <- neff_ratio(
+  design_fit,
+  pars = c(
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    "alpha_sigma",
+    "beta_sigma",
+    glue("alpha[{1:J}]"),
+    glue("sigma[{1:J}]"),
+    "lp__"
+    )
+  )
+
+mcmc_neff(design_neff, size = 2) + yaxis_text(hjust = 1)
+
+```
+
+```{r design_print, eval = FALSE}
+
+summary(
+  design_fit,
+  pars = c(
+    # "mu_gamma", "tau_gamma", "L", 
+    "gamma",
+    "alpha_sigma", "beta_sigma",
+    "tau_alpha", "alpha", "sigma"
+    )
+  ) %>%
+  .$summary %>%
+  round(2)
+
+```
+
+```{r design_training_fit}
+
+design_pp_t <- extract_training_fit(design_fit, fit_name = "design")
+
+design_t_pw_summary <- summarize_preds(
+  design_pp_t,
+  type = "training"
+  )
+
+```
+
+```{r design_fit_plot, eval = FALSE}
+
+plot_stand_fits(
+  design_t_pw_summary,
+  fit_name = "design",
+  type = "training"
+  )
+
+```
+
+```{stan cb_model, output.var = "cb_model"}
+
+data {
+  int <lower = 0> N;                  // number of measured plots
+  int <lower = 0> M;
+  real y_t[N];                          // plot measurements
+  real y_h[M];
+  int <lower = 0> P;                  // number of population predictors
+  matrix[N, P] X_t;                     // population predictors
+  matrix[M, P] X_h;
+  int prior_only;
+}
+
+parameters {
+
+  // -------------- //
+  // global effects
+  // -------------- //
+
+  real mu;
+
+  // ------------- //
+  // stand effects
+  // ------------- //
+
+  // ------------------ //
+  // population effects
+  // ------------------ //
+
+  vector[P] beta;
+  real <lower = 0> sigma;
+}
+
+transformed parameters {
+  vector[N] mu_n;
+
+  mu_n = mu + X_t * beta;
+}
+
+model {
+
+  // ------------- //
+  // global priors //
+  // ------------- //
+
+  target += normal_lpdf(mu | 0, 0.1);
+
+  // ------------ //
+  // stand priors //
+  // ------------ //
+
+  // ----------------- //
+  // population priors //
+  // ----------------- //
+
+  target += normal_lpdf(beta | 0, 0.5);
+  target += exponential_lpdf(sigma | 5);
+
+  // ---------- //
+  // likelihood //
+  // ---------- //
+  
+  if(!prior_only) {
+    target += normal_lpdf(y_t | mu_n, sigma);  
+  }
+
+}
+
+generated quantities {
+  // training set
+  real y_t_new[N];
+  vector[N] log_lik_t;
+  
+  // test set
+  vector[M] mu_m;
+  vector[M] y_h_new;
+  vector[M] log_lik_h;
+  
+  mu_m = mu + X_h * beta;
+  
+  for (m in 1:M) {
+    y_h_new[m] = normal_rng(mu_m[m], sigma);
+    log_lik_h[m] = normal_lpdf(y_h[m] | mu_m[m], sigma);
+  }
+  
+  for (n in 1:N) {
+    y_t_new[n] = normal_rng(mu_n[n], sigma);
+    log_lik_t[n] = normal_lpdf(y_t[n] | mu_n[n], sigma);
+  }
+}
+
+```
+
+
+```{r cb_prior, results="hide", eval = FALSE}
+
+cb_prior_data <- list(
+  N = N,
+  M = M,
+  P = P,
+  X_t = X_t,
+  X_h = X_h,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 1
+)
+
+cb_prior <- sampling(
+  cb_model,
+  data = cb_prior_data,
+  chains = 1,
+  warmup = 1e3,
+  iter = 1500,
+  cores = 1
+)
+
+cb_prior_preds <- tidybayes::spread_draws(cb_prior, y_t_new[n])
+```
+
+```{r cb_prior_plot, eval = FALSE}
+ggplot() +
+  geom_density(
+    data = cb_prior_preds, aes(x = y_t_new, y = ..scaled.., group = .draw)
+    ) +
+  geom_density(aes(x = y_t_scaled, y = ..scaled..), color = "blue") +
+  ggtitle("Pop Effects Prior Predictive Density") +
+  theme_bw()
+
+```
+
+```{r cb_fit, results = "hide"}
+
+cb_data <- list(
+  N = N,
+  M = M,
+  P = P,
+  X_t = X_t,
+  X_h = X_h,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 0
+)
+
+cb_fit <- sampling(
+  cb_model,
+  data = cb_data,
+  # control = list(
+  #   adapt_delta = 0.99,
+  #   max_treedepth = 15
+  # ),
+  chains = 4,
+  warmup = n_warmup,
+  iter = n_iter,
+  cores = 4
+)
+
+```
+
+```{r cb_post}
+
+cb_post <- rstan::extract(
+  cb_fit,
+  inc_warmup = FALSE,
+  permuted = FALSE
+  )
+
+cb_nuts <- nuts_params(cb_fit)
+
+```
+
+```{r cb_diverge, eval = FALSE}
+
+mcmc_nuts_divergence(cb_nuts, lp = log_posterior(cb_fit))
+
+```
+
+```{r cb_parcoord, eval = FALSE}
+mcmc_parcoord(
+  cb_post,
+  np = cb_nuts,
+  pars = c("mu", glue("beta[{1:P}]"), "sigma")
+  ) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r cb_trace, eval = FALSE}
+
+cb_trace <- bayesplot::mcmc_trace(
+  cb_post, 
+  pars = c("mu", glue("beta[{1:min(c(10, P))}]"), "sigma"),
+  facet_args = list(nrow = 3, labeller = label_parsed)
+  )
+
+cb_trace + bayesplot::facet_text(size = 15)
+
+```
+
+```{r cb_scatter, eval = FALSE}
+mcmc_scatter(
+  cb_post,
+  pars = c("beta[1]", "sigma"),
+  transformations = list(sigma = "log"),
+  np = cb_nuts,
+  size = 1
+)
+
+mcmc_scatter(
+  cb_post,
+  pars = c("beta[1]", "mu"),
+  np = cb_nuts,
+  size = 1
+)
+
+```
+
+```{r cb_neff, eval = FALSE}
+
+cb_neff <- neff_ratio(
+  cb_fit,
+  pars = c("mu", glue("beta[{1:P}]"), "sigma")
+  )
+
+mcmc_neff(cb_neff, size = 2) + yaxis_text(hjust = 1)
+
+```
+
+```{r cb_print, eval = FALSE}
+
+summary(
+  cb_fit,
+  pars = c("mu", glue("beta[{1:P}]"), "sigma")
+  ) %>%
+  .$summary %>%
+  round(2)
+
+```
+
+```{r cb_training_fit}
+
+cb_pp_t <- extract_training_fit(cb_fit, fit_name = "pop effects")
+
+cb_t_pw_summary <- summarize_preds(
+  cb_pp_t,
+  type = "training"
+  )
+
+```
+
+```{r cb_training_plot, eval = FALSE}
+
+plot_stand_fits(
+  cb_t_pw_summary,
+  fit_name = "cruiseboost",
+  type = "training"
+  )
+
+```
+
+```{stan de_model, output.var = "de_model"}
+
+data {
+  int <lower = 0> N;
+  int <lower=0> M;
+  int <lower=0> J;
+  int <lower=0> K;
+  int <lower=0> R;
+  int <lower=0> P;
+  matrix[J, R] U_t;
+  matrix[K, R] U_h;
+  matrix[N, P] X_t;
+  matrix[M, P] X_h;
+  int <lower=0> jj[N];
+  int <lower=0> kk[M];
+  real y_t[N];
+  real y_h[M];
+  int prior_only;
+}
+
+parameters {
+
+  // -------------- //
+  // global effects //
+  // -------------- //
+  
+  // gamma
+  vector[R] gamma;
+
+  // sigma
+  //real<lower=0> alpha_sigma;
+  //real<lower=0> beta_sigma;
+
+  // ------------- //
+  // stand-level effects //
+  // ------------- //
+  
+  // alpha
+  vector[J] alpha_tilde;
+  real<lower=0> tau_alpha;
+  
+  //sigma
+  real<lower=0> sigma;
+  // real<lower=0> sigma[N];
+  
+  // ------------------ //
+  // population effects //
+  // ------------------ //
+  
+  vector[P] beta;
+
+}
+
+transformed parameters {
+  vector[J] alpha;
+  real mu_n[N];
+  // real sigma_n[N];
+  
+  alpha = U_t * gamma + tau_alpha * alpha_tilde;
+
+  for (n in 1:N) {
+    mu_n[n] = alpha[jj[n]] + X_t[n] * beta;
+    //sigma_n[n] = sigma[jj[n]];
+  }
+}
+
+model {
+
+  // ------------- //
+  // global priors //
+  // ------------- //
+  
+  // gamma
+  target += normal_lpdf(gamma | 0, 0.1);
+  
+  // sigma
+  //target += normal_lpdf(alpha_sigma | 10, 1);
+  //target += normal_lpdf(beta_sigma | 10, 1);
+  
+  // ------------ //
+  // stand priors //
+  // ------------ //
+  
+  // alpha
+  target += normal_lpdf(tau_alpha | 0, 1);
+  target += normal_lpdf(alpha_tilde | 0, 1);
+  
+  // sigma
+  // target += inv_gamma_lpdf(sigma | alpha_sigma, beta_sigma);
+  target += exponential_lpdf(sigma | 5);
+  
+  // ----------------- //
+  // population priors //
+  // ----------------- //
+  
+  target += normal_lpdf(beta | 0, 1);
+
+  // ---------- //
+  // likelihood //
+  // ---------- //
+  
+  // target += normal_lpdf(y | mu_n, sigma_n);
+  if(!prior_only) {
+    target += normal_lpdf(y_t | mu_n, sigma);
+  }
+}
+
+generated quantities {
+  real alpha_new[K];
+  vector[M] mu_m;
+  vector[M] y_h_new;
+  vector[N] y_t_new;
+  vector[M] log_lik_h;
+  vector[N] log_lik_t;
+  
+  for (k in 1:K) {
+    alpha_new[k] = normal_rng(U_h[k] * gamma, tau_alpha);
+  }
+  
+  for (m in 1:M) {
+    mu_m[m] = alpha_new[kk[m]] + X_h[m] * beta;
+    //sigma_m[m] = sigma_new[kk[m]];
+    y_h_new[m] = normal_rng(mu_m[m], sigma);
+    log_lik_h[m] = normal_lpdf(y_h[m] | mu_m[m], sigma);
+  }
+  
+  for (n in 1:N) {
+    y_t_new[n] = normal_rng(mu_n[n], sigma);
+    log_lik_t[n] = normal_lpdf(y_t[n] | mu_n[n], sigma);
+  }
+}
+
+```
+
+```{r de_prior, eval = FALSE}
+
+de_prior_data <- list(
+  N = N,
+  M = M,
+  J = J,
+  K = K,
+  R = R,
+  P = P,
+  U_t = U_t,
+  U_h = U_h,
+  X_t = X_t,
+  X_h = X_h,
+  jj = jj,
+  kk = kk,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 1
+)
+
+de_prior <- sampling(
+  de_model,
+  data = de_prior_data,
+  chains = 1,
+  warmup = 1e3,
+  iter = 1500,
+  cores = 1
+)
+
+de_prior_preds <- tidybayes::spread_draws(de_prior, y_t_new[n])
+```
+
+```{r de_prior_plot, eval = FALSE}
+ggplot() +
+  geom_density(
+    data = de_prior_preds, aes(x = y_t_new, y = ..scaled.., group = .draw)
+    ) +
+  geom_density(aes(x = y_t_scaled, y = ..scaled..), color = "blue") +
+  ggtitle("Design Effects Prior Predictive Density") +
+  theme_bw()
+
+```
+
+```{r de_model_fit, results = "hide"}
+
+de_data <- list(
+  N = N,
+  M = M,
+  J = J,
+  K = K,
+  R = R,
+  P = P,
+  U_t = U_t,
+  U_h = U_h,
+  X_t = X_t,
+  X_h = X_h,
+  jj = jj,
+  kk = kk,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 0
+)
+
+de_fit <- sampling(
+  de_model,
+  data = de_data,
+  # control = list(
+  #   adapt_delta = 0.99,
+  #   max_treedepth = 15
+  # ),
+  chains = n_chains,
+  warmup = n_warmup,
+  iter = n_iter,
+  cores = n_chains
+)
+
+```
+
+```{r de_post}
+
+de_post <- rstan::extract(
+  de_fit,
+  inc_warmup = FALSE,
+  permuted = FALSE
+  )
+
+de_nuts <- nuts_params(de_fit)
+
+```
+
+```{r de_divergence, eval = FALSE}
+
+mcmc_nuts_divergence(de_nuts, lp = log_posterior(de_fit))
+
+```
+
+```{r de_parcoord, eval = FALSE}
+mcmc_parcoord(
+  de_post,
+  np = de_nuts,
+  pars = c(
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    glue("alpha[{1:J}]"), 
+    # glue("sigma[{1:J}]"),
+    glue("beta[{1:P}]"),
+    "sigma"
+    )
+  ) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r de_model_trace, eval = FALSE}
+
+de_hyper_trace <- bayesplot::mcmc_trace(
+  de_post, 
+  pars = c(
+    glue("gamma[{1:R}]"),
+    "tau_alpha"
+    # "alpha_sigma",
+    # "beta_sigma"
+    ),
+  facet_args = list(nrow = 3, labeller = label_parsed))
+
+de_hyper_trace + bayesplot::facet_text(size = 15)
+
+# de_beta_trace <- bayesplot::mcmc_trace(
+#   de_post, 
+#   pars = c(glue::glue("beta[{1:P}]")),
+#   n_warmup = 1e3,
+#   facet_args = list(nrow = 3, labeller = label_parsed))
+# 
+# de_beta_trace + bayesplot::facet_text(size = 15)
+# 
+# de_alpha_trace <- bayesplot::mcmc_trace(
+#   de_post, 
+#   pars = c(glue::glue("alpha[{1:J}]")),
+#   n_warmup = 1e3,
+#   facet_args = list(nrow = 3, labeller = label_parsed))
+# 
+# de_alpha_trace + bayesplot::facet_text(size = 15)
+# 
+# de_sigma_trace <- bayesplot::mcmc_trace(
+#   de_post, 
+#   pars = c(glue::glue("sigma[{1:J}]")),
+#   n_warmup = 1e3,
+#   facet_args = list(nrow = 3, labeller = label_parsed))
+# 
+# de_sigma_trace + bayesplot::facet_text(size = 15)
+
+```
+
+```{r de_scatter, eval = FALSE}
+mcmc_scatter(
+  de_post,
+  pars = c("gamma[1]", "gamma[2]"),
+  np = de_nuts,
+  size = 1
+)
+
+```
+
+```{r de_neff, eval = FALSE}
+
+de_neff <- neff_ratio(
+  de_fit,
+  pars = c(
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    # "alpha_sigma",
+    # "beta_sigma",
+    glue("alpha[{1:J}]"), 
+    # glue("sigma[{1:J}]"),
+    glue("beta[{1:P}]"),
+    "sigma",
+    "lp__"
+  )
+)
+
+mcmc_neff(de_neff, size = 2) + yaxis_text(hjust = 1)
+
+```
+
+```{r de_model_print, eval = FALSE}
+
+summary(
+  de_fit,
+  pars = c(
+    "gamma",
+    "tau_alpha", 
+    "alpha", "beta",
+    "sigma"
+    )
+  ) %>%
+  .$summary %>%
+  round(2)
+
+```
+
+```{r de_training_fit}
+
+de_pp_t <- extract_training_fit(de_fit, fit_name = "design effects")
+
+de_t_pw_summary <- summarize_preds(
+  de_pp_t,
+  type = "training"
+  )
+```
+
+```{r de_training_plot, eval = FALSE}
+plot_stand_fits(
+  de_t_pw_summary,
+  fit_name = "design effects",
+  type = "training"
+  )
+
+```
+
+```{stan pen_de_model, output.var = "pen_de_model"}
+
+data {
+  int <lower = 0> N;
+  int <lower=0> M;
+  int <lower=0> J;
+  int <lower=0> K;
+  int <lower=0> R;
+  int <lower=0> P;
+  matrix[J, R] U_t;
+  matrix[K, R] U_h;
+  matrix[N, P] X_t;
+  matrix[M, P] X_h;
+  int <lower=0> jj[N];
+  int <lower=0> kk[M];
+  real y_t[N];
+  real y_h[M];
+  int prior_only;
+}
+
+transformed data {
+
+  real p0 = 3;           // Expected number of large slopes
+  real slab_scale = 0.5;    // Scale for marg t dist of large slopes
+  real slab_scale2 = square(slab_scale);
+  real slab_df = 25;      // Effective degrees of freedom for marg t dist of large slopes
+  real half_slab_df = 0.5 * slab_df;
+
+}
+
+parameters {
+
+  // -------------- //
+  // global effects //
+  // -------------- //
+  
+  vector[R] gamma;
+
+  // ------------- //
+  // stand-level effects //
+  // ------------- //
+  
+  vector[J] alpha_tilde;
+  real<lower=0> tau_alpha;
+  
+  // ------------------ //
+  // population effects //
+  // ------------------ //
+  
+  vector[P] beta_tilde;
+  vector<lower=0>[P] lambda;
+  real<lower=0> c2_tilde;
+  real<lower=0> tau_tilde;
+  
+  real<lower=0> sigma;
+  
+}
+
+transformed parameters {
+  vector[J] alpha;
+  vector[P] beta;
+  vector[N] mu_n;
+  // real sigma_n[N];
+  
+  alpha = U_t * gamma + tau_alpha * alpha_tilde;
+
+  {
+    real tau0 = (p0 / (P - p0)) * (sigma / sqrt(1.0 * N));
+    real tau = tau0 * tau_tilde; // tau ~ cauchy(0, tau0)
+
+    // c2 ~ inv_gamma(half_slab_df, half_slab_df * slab_scale2)
+    // Implies that marginally beta ~ student_t(slab_df, 0, slab_scale)
+    real c2 = slab_scale2 * c2_tilde;
+
+    vector[P] lambda_tilde =
+      sqrt( c2 * square(lambda) ./ (c2 + square(tau) * square(lambda)) );
+
+    // beta ~ normal(0, tau * lambda_tilde)
+    beta = tau * lambda_tilde .* beta_tilde;
+  }
+
+  for (n in 1:N) {
+    mu_n[n] = alpha[jj[n]] + X_t[n] * beta;
+    //sigma_n[n] = sigma[jj[n]];
+  }
+}
+
+model {
+
+  // ------------- //
+  // global priors //
+  // ------------- //
+  
+  // gamma
+  target += normal_lpdf(gamma | 0, 0.1);
+  
+  // ------------ //
+  // stand priors //
+  // ------------ //
+  
+  // alpha
+  target += normal_lpdf(tau_alpha | 0, 1);
+  target += normal_lpdf(alpha_tilde | 0, 1);
+  
+  // ----------------- //
+  // population priors //
+  // ----------------- //
+  
+  // beta
+  target += normal_lpdf(beta_tilde | 0, 1);
+  target += cauchy_lpdf(lambda | 0, 1);
+  target += cauchy_lpdf(tau_tilde | 0, 1);
+  target += inv_gamma_lpdf(c2_tilde | half_slab_df, half_slab_df);
+  
+  // sigma
+  target += exponential_lpdf(sigma | 5);
+  
+  // ---------- //
+  // likelihood //
+  // ---------- //
+  
+  if(!prior_only) {
+    target += normal_lpdf(y_t | mu_n, sigma);
+  }
+}
+
+generated quantities {
+  real alpha_new[K];
+  vector[M] mu_m;
+  vector[M] y_h_new;
+  vector[N] y_t_new;
+  vector[M] log_lik_h;
+  vector[N] log_lik_t;
+  
+  for (k in 1:K) {
+    alpha_new[k] = normal_rng(U_h[k] * gamma, tau_alpha);
+  }
+  
+  for (m in 1:M) {
+    mu_m[m] = alpha_new[kk[m]] + X_h[m] * beta;
+    y_h_new[m] = normal_rng(mu_m[m], sigma);
+    log_lik_h[m] = normal_lpdf(y_h[m] | mu_m[m], sigma);
+  }
+  
+  for (n in 1:N) {
+    y_t_new[n] = normal_rng(mu_n[n], sigma);
+    log_lik_t[n] = normal_lpdf(y_t[n] | mu_n[n], sigma);
+  }
+}
+
+```
+
+
+```{r pen_de_prior, eval = FALSE}
+
+pen_de_prior_data <- list(
+  N = N,
+  M = M,
+  J = J,
+  K = K,
+  R = R,
+  P = P,
+  U_t = U_t,
+  U_h = U_h,
+  X_t = X_t,
+  X_h = X_h,
+  jj = jj,
+  kk = kk,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 1
+)
+
+pen_de_prior <- sampling(
+  pen_de_model,
+  data = pen_de_prior_data,
+  chains = 1,
+  warmup = 1e3,
+  iter = 1500,
+  cores = 1
+)
+
+pen_de_prior_preds <- tidybayes::spread_draws(pen_de_prior, y_t_new[n])
+```
+
+```{r pen_de_prior_plot, eval = FALSE}
+ggplot() + 
+  geom_density(
+    data = pen_de_prior_preds, aes(x = y_t_new, y = ..scaled.., group = .draw)
+    ) +
+  geom_density(aes(x = y_t_scaled, y = ..scaled..), color = "blue") +
+  ggtitle("Penalized Design Effects Prior Predictive Density") +
+  theme_bw()
+
+```
+
+```{r pen_de_fit, results = "hide"}
+
+pen_de_fit_data <- list(
+  N = N,
+  M = M,
+  J = J,
+  K = K,
+  R = R,
+  P = P,
+  U_t = U_t,
+  U_h = U_h,
+  X_t = X_t,
+  X_h = X_h,
+  jj = jj,
+  kk = kk,
+  y_t = y_t_scaled,
+  y_h = y_h_scaled,
+  prior_only = 0
+)
+
+pen_de_fit <- sampling(
+  pen_de_model,
+  data = pen_de_fit_data,
+  control = list(
+    adapt_delta = 0.99,
+    max_treedepth = 15
+  ),
+  chains = n_chains,
+  warmup = n_warmup,
+  iter = n_iter,
+  cores = n_chains
+)
+
+```
+
+```{r pen_de_post}
+
+pen_de_post <- rstan::extract(
+  pen_de_fit,
+  inc_warmup = FALSE,
+  permuted = FALSE
+  )
+
+pen_de_nuts <- nuts_params(pen_de_fit)
+
+```
+
+```{r pen_de_diverge, eval = FALSE}
+mcmc_nuts_divergence(pen_de_nuts, lp = log_posterior(pen_de_fit))
+```
+
+```{r pen_de_parcoord, eval = FALSE}
+mcmc_parcoord(
+  pen_de_post,
+  np = pen_de_nuts,
+  pars = c(
+    glue("gamma[{1:R}]"),
+    "tau_alpha",
+    glue("alpha[{1:J}]"), 
+    glue("beta[{1:P}]"),
+    "sigma"
+  )
+) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+```{r pen_de_trace, eval = FALSE}
+
+pen_de_trace <- bayesplot::mcmc_trace(
+  pen_de_post, 
+  pars = c("tau_alpha", glue("beta[{1:min(c(10, P))}]"), "sigma"),
+  facet_args = list(nrow = 3, labeller = label_parsed)
+  )
+
+cb_hs_trace + bayesplot::facet_text(size = 15)
+
+```
+
+```{r pen_de_scatter, eval = FALSE}
+
+mcmc_scatter(
+  pen_de_post,
+  pars = c("beta[1]", "sigma"),
+  transformations = list(sigma = "log"),
+  np = cb_hs_nuts,
+  size = 1
+)
+
+mcmc_scatter(
+  pen_de_post,
+  pars = c("beta[1]", "tau_alpha"),
+  transformations = list(tau_alpha = "log"),
+  np = pen_de_nuts,
+  size = 1
+)
+
+```
+
+```{r pen_de_neff, eval = FALSE}
+
+pen_de_neff <- neff_ratio(
+  pen_de_fit,
+  pars = c("mu", glue("beta[{1:P}]"), "sigma")
+  )
+
+mcmc_neff(pen_de_neff, size = 2) + yaxis_text(hjust = 1)
+
+```
+
+```{r pen_de_print, eval = FALSE}
+
+summary(
+  pen_de_fit,
+  pars = c(
+    "gamma",
+    "tau_alpha", 
+    "alpha",
+    glue("beta[{1:P}]"),
+    "sigma"
+    )
+  ) %>%
+  .$summary %>%
+  round(2)
+
+```
+
+```{r pen_de_training_fit}
+
+pen_de_pp_t <- extract_training_fit(
+  pen_de_fit, fit_name = "penalized design effects"
+  )
+
+pen_de_t_pw_summary <- summarize_preds(
+  pen_de_pp_t,
+  type = "training"
+  )
+
+```
+
+
+```{r pen_de_stand_plot, eval = FALSE}
+
+plot_stand_fits(
+  pen_de_t_pw_summary,
+  fit_name = "penalized design effects",
+  type = "training"
+  )
+
+```
+
+
+```{r training_fit}
+
+all_pp <- bind_rows(
+  list(
+    design_t_pw_summary,
+    cb_t_pw_summary,
+    de_t_pw_summary,
+    pen_de_t_pw_summary
+  )
+) %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+
+
+```
+
+```{r training_error}
+
+model_errors <- map_dfr(
+  list(
+    design_pp_t,
+    cb_pp_t,
+    de_pp_t,
+    pen_de_pp_t
+  ),
+  ~ summarize_error(., type = "training")
+) %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+```
+
+```{r training_error_stand, eval = FALSE}
+
+model_errors_stand  <- map_dfr(
+  list(
+    design_pp_t,
+    cb_pp_t,
+    de_pp_t,
+    pen_de_pp_t
+  ),
+  ~ summarize_error(., group = stand_id, type = "training")
+)  %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+ggplot(model_errors_stand, aes(x = model, y = med, color = measure)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper), position = position_dodge(width = 1)
+    ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  facet_wrap( ~ stand_id) +
+  ggtitle(paste(slug, "fit statistics by stand"))
+
+
+```
+
+```{r test_fit, eval = FALSE}
+
+design_pp_h <- extract_test_fit(design_fit, fit_name = "design")
+cb_pp_h <- extract_test_fit(cb_fit, fit_name = "cruiseboost")
+de_pp_h <- extract_test_fit(de_fit, fit_name = "design effects")
+pen_de_pp_h <- extract_test_fit(
+  pen_de_fit, fit_name = "penalized design effects"
+  )
+
+design_h_pw_summary <- summarize_preds(design_pp_h, type = "test")
+cb_h_pw_summary <- summarize_preds(cb_pp_h, type = "test")
+de_h_pw_summary <- summarize_preds(de_pp_h, type = "test")
+pen_de_h_pw_summary <- summarize_preds(pen_de_pp_h, type = "test")
+
+all_pp_h <- bind_rows(
+  list(
+    design_h_pw_summary,
+    cb_h_pw_summary,
+    de_h_pw_summary,
+    pen_de_h_pw_summary
+  )
+) %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+ggplot(all_pp_h) +
+  geom_point(aes(x = obs, y = med), size = 0.2) +
+  geom_errorbar(
+    aes(x = obs, ymin = lower, ymax = upper), alpha = 0.1
+  ) +
+  geom_abline() +
+  theme_bw() +
+  xlab("observation") +
+  ylab("prediction") +
+  facet_wrap(~ model) +
+  ggtitle(paste(slug, "test fit"))
+
+```
+
+```{r test_error, eval = FALSE}
+
+all_pp_h <- bind_rows(
+  list(
+    design_pp_h,
+    cb_pp_h,
+    de_pp_h,
+    pen_de_pp_h
+  )
+)
+
+model_errors_h <- map_dfr(
+  list(
+    design_pp_h,
+    cb_pp_h,
+    de_pp_h,
+    pen_de_pp_h
+  ),
+  ~ summarize_error(., type = "test")
+) %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+model_errors_stand_h  <- map_dfr(
+  list(
+    design_pp_h,
+    cb_pp_h,
+    de_pp_h,
+    pen_de_pp_h
+  ),
+  ~ summarize_error(., group = stand_id, type = "training")
+)  %>%
+  ungroup() %>%
+  mutate(
+    model = factor(
+      model,
+      levels = c(
+        "design", "pop effects", "design effects", "penalized design effects"
+      )
+    )
+  )
+
+ggplot(model_errors_h, aes(x = model, y = med)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper), position = position_dodge(width = 1)
+    ) +
+  facet_wrap( ~ measure) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  ggtitle(paste(slug, "fit statistics"))
+
+ggplot(model_errors_stand, aes(x = model, y = med, color = measure)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper), position = position_dodge(width = 1)
+    ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  facet_wrap( ~ stand_id) +
+  ggtitle(paste(slug, "fit statistics by stand"))
+
+```
+
+```{r cruised_stand_prediction}
+
+design_post_samps <- spread_draws(
+  design_fit,
+  gamma[r], tau_alpha, alpha_sigma, beta_sigma, alpha[j], sigma[j]
+  ) %>%
+  group_by(
+    .chain, .iteration, .draw,
+    tau_alpha, alpha_sigma, beta_sigma, j,
+    alpha, sigma
+  ) %>%
+  nest(gamma, .key = "gamma")
+
+cb_post_samps <- spread_draws(
+  cb_fit, mu, beta[b], sigma
+  ) %>%
+  group_by(.chain, .iteration, .draw, mu, sigma) %>%
+  nest(beta, .key = beta) %>%
+  ungroup()
+
+de_post_samps_stand <- spread_draws(
+  de_fit,
+  tau_alpha,
+  alpha[j], sigma
+  ) %>%
+  ungroup()
+
+de_post_samps_gamma <- spread_draws(
+  de_fit,
+  gamma[r]
+  ) %>%
+  group_by(.chain, .iteration, .draw) %>%
+  nest(.key = "gamma") %>%
+  ungroup()
+
+de_post_samps_beta <- spread_draws(
+  de_fit,
+  beta[b]
+  ) %>%
+  group_by(.chain, .iteration, .draw) %>%
+  nest(.key = "beta") %>%
+  ungroup()
+
+de_post_samps <- reduce(
+  .x = list(
+    de_post_samps_stand,
+    de_post_samps_gamma,
+    de_post_samps_beta
+    ),
+  left_join,
+  by = c(".chain", ".iteration", ".draw")
+)
+
+pen_de_post_samps_stand <- spread_draws(
+  pen_de_fit,
+  tau_alpha,
+  alpha[j], sigma
+  ) %>%
+  ungroup()
+
+pen_de_post_samps_gamma <- spread_draws(
+  de_fit,
+  gamma[r]
+  ) %>%
+  group_by(.chain, .iteration, .draw) %>%
+  nest(.key = "gamma") %>%
+  ungroup()
+
+pen_de_post_samps_beta <- spread_draws(
+  de_fit,
+  beta[b]
+  ) %>%
+  group_by(.chain, .iteration, .draw) %>%
+  nest(.key = "beta") %>%
+  ungroup()
+
+pen_de_post_samps <- reduce(
+  .x = list(
+    pen_de_post_samps_stand,
+    pen_de_post_samps_gamma,
+    pen_de_post_samps_beta
+    ),
+  left_join,
+  by = c(".chain", ".iteration", ".draw")
+)
+
+```
+
+```{r functions}
+
+predict_fit_stand <- function(
+  stand,
+  n_post = 100,
+  all_pix,
+  design_post_samps,
+  cb_post_samps,
+  de_post_samps,
+  pen_de_post_samps,
+  pointwise = FALSE
+  ) {
+
+  pix <- all_pix %>%
+    filter(anon_id == stand) %>%
+    left_join(fit_stands, by = "anon_id") %>%
+    mutate(n = 1:n()) %>%
+    gather(key = score, value = pc, contains("pca")) %>%
+    group_by(
+      anon_id, lon, lat, stand_acre, sample_weight, j, n
+    ) %>%
+    nest(pc, .key = X) %>%
+    ungroup()
+  
+  n_pix <- nrow(pix)
+  n_samps <- max(design_post_samps$.draw)
+
+  # design
+
+  design_preds <- design_post_samps %>%
+    filter(j %in% pix$j) %>%
+    sample_n(n_pix * n_post, replace = T) %>%
+    mutate(
+      n = rep(1:n_pix, n_post)
+    ) %>%
+    group_by(n) %>%
+    mutate(
+      samp = 1:n_post
+    ) %>%
+    ungroup() %>%
+    left_join(pix, by = "n") %>%
+    mutate(
+      fit = "design",
+      pred = rnorm(n = n(), alpha, sigma) * sd(y_t) + mean(y_t),
+      pred = ifelse(pred < 0, 0, pred)
+    ) %>%
+    select(anon_id, lon, lat, fit, samp, pred)
+  
+  # pop effects
+  
+  cb_preds <- cb_post_samps %>%
+    sample_n(n_pix * n_post, replace = T) %>%
+    mutate(
+      n = rep(1:n_pix, n_post)
+    )%>%
+    group_by(n) %>%
+    mutate(
+      samp = 1:n_post
+    ) %>%
+    ungroup() %>%
+    left_join(pix, by = "n") %>%
+    mutate(
+      fit = "pop effects",
+      X_beta = map2_dbl(.x = X, .y = beta, ~ t(.x$pc) %*% .y$beta),
+      pred = rnorm(n = n(), mean = mu + X_beta, sd = sigma) * sd(y_t) + mean(y_t),
+      pred = ifelse(pred < 0, 0, pred)
+    ) %>%
+    select(anon_id, lon, lat, fit, samp, pred)
+
+  # design effects
+
+  de_preds <- de_post_samps %>%
+    filter(j %in% pix$j) %>%
+    sample_n(n_pix * n_post, replace = T) %>%
+    mutate(n = rep(1:n_pix, n_post))%>%
+    group_by(n) %>%
+    mutate(samp = 1:n_post) %>%
+    ungroup() %>%
+    left_join(pix, by = "n") %>%
+    mutate(
+      fit = "design effects",
+      X_beta = map2_dbl(.x = X, .y = beta, ~ t(.x$pc) %*% .y$beta),
+      pred = rnorm(n = n(), alpha + X_beta, sigma) * sd(y_t) + mean(y_t),
+      pred = ifelse(pred < 0, 0, pred)
+    ) %>%
+    select(anon_id, lon, lat, fit, samp, pred)
+  
+  pen_de_preds <- pen_de_post_samps %>%
+    filter(j %in% pix$j) %>%
+    sample_n(n_pix * n_post, replace = T) %>%
+    mutate(n = rep(1:n_pix, n_post))%>%
+    group_by(n) %>%
+    mutate(samp = 1:n_post) %>%
+    ungroup() %>%
+    left_join(pix, by = "n") %>%
+    mutate(
+      fit = "penalized design effects",
+      X_beta = map2_dbl(.x = X, .y = beta, ~ t(.x$pc) %*% .y$beta),
+      pred = rnorm(n = n(), alpha + X_beta, sigma) * sd(y_t) + mean(y_t),
+      pred = ifelse(pred < 0, 0, pred)
+    ) %>%
+    select(anon_id, lon, lat, fit, samp, pred)
+
+  all_preds <- reduce(
+    list(
+      design_preds,
+      cb_preds,
+      de_preds,
+      pen_de_preds
+    ),
+    bind_rows
+  )
+  
+  if (pointwise) {
+    out_pix <- all_preds %>%
+      group_by(anon_id, lon, lat, fit) %>%
+      summarize(mean_pred = mean(pred))
+    return(out_pix)
+  }
+
+  pred_summary <- all_preds %>%
+    group_by(anon_id, fit, samp) %>%
+    summarize(
+      mu_hat = mean(pred)
+    ) %>%
+    group_by(anon_id, fit) %>%
+    summarize(
+      mean_pred = mean(mu_hat),
+      upper_pred = quantile(mu_hat, 0.95),
+      lower_pred = quantile(mu_hat, 0.05)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      fit = factor(
+        fit,
+        levels = c(
+          "design", "pop effects", "design effects", "penalized design effects"
+        )
+      )
+    ) %>%
+    arrange(fit)
+
+  pred_summary
+
+}
+
+```
+
+```{r cruised_stand_eval}
+
+pointwise_preds_list <- lapply(
+  fit_stands$anon_id,
+  predict_fit_stand,
+  all_pix = all_pix,
+  n_post = 1e2,
+  design_post_samps = design_post_samps,
+  cb_post_samps = cb_post_samps,
+  de_post_samps = de_post_samps,
+  pen_de_post_samps = pen_de_post_samps,
+  pointwise = TRUE
+)
+
+pointwise_preds <- bind_rows(pointwise_preds_list)
+
+cruised_preds_list <- lapply(
+  fit_stands$anon_id,
+  predict_fit_stand,
+  all_pix = all_pix,
+  n_post = 1e2,
+  design_post_samps = design_post_samps,
+  cb_post_samps = cb_post_samps,
+  de_post_samps = de_post_samps,
+  pen_de_post_samps = pen_de_post_samps
+)
+
+freq_intervals <- fit_training %>%
+  group_by(anon_id) %>%
+  summarize(
+    mean = mean(baph),
+    se = sqrt(sd(baph)) / n()
+  ) %>%
+  transmute(
+    anon_id,
+    fit = "freq interval",
+    mean_pred = mean,
+    upper_pred = mean + 2 * se,
+    lower_pred = mean - 2 * se
+  )
+
+cruised_pred_summary <- bind_rows(cruised_preds_list) %>%
+  bind_rows(freq_intervals) %>%
+  mutate(
+    fit = factor(
+      fit,
+      levels = c(
+        "freq interval",
+        "design", "pop effects", "design effects", "penalized design effects"
+        )
+      )
+  ) 
+
+save.image("~/workspace/poster_env.Rda")
+
+```
+
+```{r poster_assets}
+
+load("~/workspace/poster_env.Rda")
+
+
+if (!file.exists("/tmp/stancon")) {
+  dir.create("/tmp/stancon")
+}
+
+fit_stand_table <- fit_training %>%
+  mutate(stand_ha = stand_acre * 0.404686) %>%
+  group_by(anon_id, stand_ha, sample_weight) %>%
+  summarize(
+    n_plots = n()
+  ) %>%
+  mutate(type = "training")
+
+test_stand_table <- test_training %>%
+  mutate(stand_ha = stand_acre * 0.404686) %>%
+  group_by(anon_id, stand_ha, sample_weight) %>%
+  summarize(
+    n_plots = n()
+  ) %>%
+  mutate(type = "test")
+
+stand_table <- bind_rows(
+  fit_stand_table,
+  test_stand_table
+  ) %>%
+  ungroup() %>%
+  mutate(
+    stand_ha = round(stand_ha, 1),
+    sample_weigth = round(sample_weight, 3)
+    )
+
+write_csv(stand_table, path = "/tmp/stancon/stand_table.csv")
+
+fit_fig <- ggplot(all_pp) +
+  geom_point(aes(x = obs, y = med), size = 0.2) +
+  geom_errorbar(
+    aes(x = obs, ymin = lower, ymax = upper), alpha = 0.1
+  ) +
+  geom_abline() +
+  theme_bw() +
+  xlab("observation") +
+  ylab("prediction") +
+  facet_wrap(~ model) +
+  ggtitle(paste("training fit"))
+
+error_fig <- ggplot(model_errors, aes(x = model, y = med)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper), position = position_dodge(width = 1)
+    ) +
+  facet_wrap( ~ measure) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  ggtitle("training error")
+
+main_finding_fig <- ggplot(cruised_pred_summary, aes(x = fit, y = mean_pred)) +
+  geom_linerange(
+    aes(ymin = lower_pred, ymax = upper_pred)
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  facet_wrap( ~ anon_id, scales = "free_y") +
+  ggtitle("stand mean basal area inferences")
+
+heat_data <- pointwise_preds %>%
+  filter(
+    fit == "penalized design effects",
+    anon_id %in% c(
+      # "precious_tortoise",
+      # "illusory_harrier",
+      # "grim_sora",
+      "petulant_turkey"
+      )
+    ) %>%
+  rename(baph = mean_pred)
+
+heat_fig <- ggplot() +
+  geom_tile(data = heat_data, aes(x = lon, y = lat, fill = baph)) +
+  coord_equal() +
+  theme_bw() +
+  scale_fill_viridis(
+    name = expression(m^{2} ~ ha^{-1}),
+    breaks = seq(from = 0, to = 30, by = 5)
+    ) +
+  theme(
+    legend.position="right",
+    legend.key.height=unit(2, "cm"),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank()
+    ) + 
+  ggtitle("Example forest stand basal area predictions")
+
+heat_fig
+
+ggsave(
+  heat_fig, 
+  filename = "heat_fig.png",
+  path = "/tmp/stancon",
+  width = 10, 
+  height = 8, 
+  dev = "png"
+)
+  
+ggsave(
+  main_finding_fig, 
+  filename = "main_finding_fig.png",
+  path = "/tmp/stancon",
+  width = 12, 
+  height = 8, 
+  dev = "png"
+  )
+
+ggsave(
+  error_fig, 
+  filename = "error_fig.png",
+  path = "/tmp/stancon",
+  width = 4, 
+  height = 5, 
+  dev = "png"
+  )
+
+ggsave(
+  fit_fig, 
+  filename = "fit_fig.png",
+  path = "/tmp/stancon",
+  width = 6, 
+  height = 5, 
+  dev = "png"
+  )
+
+```
