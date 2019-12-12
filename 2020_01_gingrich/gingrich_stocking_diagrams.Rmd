@@ -1,0 +1,135 @@
+---
+title: "Gingrich stocking diaggrams"
+author: "Brian Clough"
+date: "10/14/2019"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(tsutils)
+install.packages('directlabels')
+library(directlabels)
+```
+
+```{r params}
+Aline_b0 <- -0.0507
+Aline_b1 <- 0.1698
+Aline_b2 <- 0.0317
+
+Bline_b0 <- 0.175
+Bline_b1 <- 0.205
+Bline_b2 <- 0.06
+
+Amd_b0 <- -0.259
+Amd_b1 <- 0.973
+```
+
+```{r fxns}
+
+calculate_stocking_stats <- function(stocking, qmdVec, amdVec){
+  stockingTPA <- (adjustment * (stocking * 10)) / (Aline_b0 + Aline_b1 * amdVec + Aline_b2 * qmdVec^2)
+  stockingBAPA <- pi * (qmdVec / 24)^2 * stockingTPA
+  
+  tmpFrame <- data.frame(stocking, QMD = qmdVec, TPA = stockingTPA, BAPA = stockingBAPA)
+  return(tmpFrame)
+}
+
+```
+
+```{r inputs}
+qmd <- seq(from = 2, to = 22)
+percent <- 100
+adjustment <- 1
+
+stockingLines <- seq(from = 20, to = 110, by = 10)
+```
+
+```{r amd}
+amd <- Amd_b0 + qmd * Amd_b1
+```
+
+```{r stockingFrame}
+stockingFrame <- bind_rows(lapply(stockingLines, qmdVec = qmd, amdVec = amd, calculate_stocking_stats)) %>%
+  mutate(QMD_plot = case_when(QMD %in% c(21, 19, 17, 15) ~ '',
+                              TRUE ~ as.character(QMD)))
+```
+
+```{r lines}
+
+bLineTab <- data.frame(QMD = qmd, AMD = amd) %>%
+           mutate(TPA = (adjustment * (100 * 10)) / (Bline_b0 + Bline_b1 * amd + Bline_b2 * qmd^2),
+                  BAPA = pi * (QMD / 24)^2 * TPA)
+
+```
+
+```{r gingrichDiagrams}
+smallFrame <- stockingFrame %>% filter(QMD <= 7)
+largeFrame <- stockingFrame %>% filter(QMD >= 7)
+
+gingrichPlotSmall <- ggplot(smallFrame, aes(x = TPA, y = BAPA)) + 
+                   geom_line(aes(group = stocking), color = 'dark gray') +
+                   geom_line(aes(group = QMD), color = 'dark gray') +
+                   geom_line(data = smallFrame %>% filter(stocking == 100), size = 1) +
+                   geom_line(data = bLineTab %>% filter(QMD <= 7), size = 1) +
+                   geom_dl(aes(label = QMD_plot), 
+                           method = list(dl.combine("last.points"), 
+                                         cex = 0.8, hjust = -1.75)) +
+                   geom_dl(aes(label = stocking), 
+                           method = list(dl.combine("last.points"), 
+                                         cex = 0.8, hjust = -1.75)) +
+                   annotate(geom = "text", x = 2500, y = 30, label = "Stocking (%)") +
+                   annotate(geom = "text", x = 2000, y = 100, label = "QMD") +
+                   theme_bw()
+
+gingrichPlotLarge <- ggplot(largeFrame, aes(x = TPA, y = BAPA)) + 
+                   geom_line(aes(group = stocking), color = 'dark gray') +
+                   geom_line(aes(group = QMD), color = 'dark gray') +
+                   geom_line(data = largeFrame %>% filter(stocking == 100), size = 1) +
+                   geom_line(data = bLineTab %>% filter(QMD >= 7), size = 1) +
+                   geom_dl(aes(label = QMD_plot), 
+                           method = list(dl.combine("last.points"), 
+                                         cex = 0.8, hjust = 0, vjust = -.25)) +
+                   geom_dl(aes(label = stocking), 
+                           method = list(dl.combine("last.points"), 
+                                         cex = 0.8, hjust = -0.5)) +
+                   annotate(geom = "text", x = 325, y = 40, label = "Stocking (%)") +
+                   annotate(geom = "text", x = 300, y = 150, label = "QMD") +
+                   theme_bw()
+
+```
+
+```{r example}
+standTab <- data.frame(QMD = c(7.2, 11.8), TPA = c(245, 190), BAPA = c(70, 125))
+
+if(standTab$QMD <= 7){
+  usePlot <- gingrichPlotSmall
+} else {
+  usePlot <- gingrichPlotLarge
+}
+
+png('/tmp/stocking_chart.png',
+     width = 5.5, height = 4, units = 'in', res = 3000)
+usePlot + geom_point(data = standTab, aes(x = TPA, y = BAPA), color = c('red', 'blue'), size = 3)
+dev.off()
+
+standOut <- standTab %>%
+            mutate(amd = Amd_b0 + Amd_b1 * QMD,
+                   aLineTPA = (adjustment * (100 * 10)) / 
+                               (Aline_b0 + Aline_b1 * amd + Aline_b2 * QMD^2),
+                   bLineTPA = (adjustment * (100 * 10)) / 
+                               (Bline_b0 + Bline_b1 * amd + Bline_b2 * QMD^2),
+                   aLineBAPA = pi * (QMD / 24)^2 * aLineTPA,
+                   bLineBAPA = pi * (QMD / 24)^2 * bLineTPA) %>%
+                   mutate(
+                     stockingLevel = case_when(BAPA < bLineBAPA ~ "understocked",
+                                               BAPA >= bLineBAPA & BAPA <= aLineBAPA ~ 
+                                                 "fully stocked",
+                                               BAPA > aLineBAPA ~ "overstocked") 
+                   ) %>%
+                   select(QMD, TPA, BAPA, stockingLevel)
+
+```
