@@ -1,0 +1,192 @@
+---
+title: "Comparing dominant height approaches"
+author: "Brian Clough"
+date: "08/25/2021"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+
+Lately I've been thinking a lot about how in forestry, many of the "measurements" we work with are really estimates. This came 
+up in a recent project, where one of the goals was to estimate dominant height for a set of stands. We were seeing some discrepancies
+among a couple different workups and, being a pretty experienced group of biometricians, we immediately asked each other how we'd 
+defined dominant height when we did our calculations. Many of us know the definition of dominant height as "the average height of 
+dominant and co-dominant trees". And if you've spent time working with inventory data, you know there's about a dozen different 
+ways you can define it. Once we talked things through, we quickly got on the same page and reconciled the differences. 
+
+This is a pretty common story in our field, and it comes up in a lot of different contexts (estimating volume, value, carbon, etc.).
+It highlights the importance of an often underappreciated concept in statistics: the observation model. Simply put, the observation 
+model links the thing you actually measure (trees on inventory plots) to value you're trying to approximate (dominant height of a stand).
+In our example, the observation model includes the method we used to define dominant and co-dominant trees for the purpose of estimating 
+plot, and in turn stand, dominant height. The choices you make when defining your observation model can have downstream consequences 
+for your estimates and inferences. 
+
+To illustrate, we'll expand on our original example of dominant height and look at how the choice of observation model impacts the 
+development of site index curves. We'll work with FIA data, and for simplicity's sake we'll confine our comparison to Douglas-fir in 
+Oregon. We'll consider two different observation models of site index, that will differ in the method used to estimate dominant height:
+1. Define dominant height as the mean of all dominant and co-dominant trees as defined by FIA's crown class code (CCLD).
+2. Define dominant height as the mean of all trees above the 80th percent quantile of each plot. 
+
+
+We'll define age of the plot using FIA measurements of breast-height age (BHAGE). To understand the impact of the choice of 
+observation model, we'll then fit some nonlinear height/age models to the data, using each of the formulations of dominant height 
+as the response variable. If you want to step through the example, code can be in the forestry source Github repo.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(sf)
+remotes::install_github("SilviaTerra/tidyFIA")
+library(tidyFIA)
+library(brms)
+library(tidybayes)
+install.packages('tigris')
+library(tigris)
+
+divergent_palette <- rep(
+  c(
+    "#439E45", "#072649", "#DBE62F", "#6C7A8B", "#1CB3B5",
+    "#E5330F", "#251EB1", "#CACEC6", "#93C7EE", "#C947D1",
+    "#79FFE7", "#63340A"
+  ),
+  6
+)
+
+scale_colour_discrete <- function(...) {
+  scale_colour_manual(..., values = divergent_palette)
+}
+scale_fill_discrete <- function(..., values = divergent_palette) {
+  scale_fill_manual(..., values = values)
+}
+
+scale_fill_continuous <- ggplot2::scale_fill_viridis_c
+scale_colour_continuous <- ggplot2::scale_colour_viridis_c
+
+```
+
+```{r query_and_filter}
+
+or_fia <- tidy_fia(states = "OR", postgis = TRUE)
+
+or_cond <- or_fia[["cond"]] %>% 
+           filter(condprop_unadj > 0.99) %>% #Only single condition plots
+           select(plt_cn, fortypcd)
+
+df_plots <- or_fia[["plot"]] %>% 
+            filter(plot_status_cd == 1) %>% #Only measured, forested plots 
+            filter(invyr > 2016) %>% #Only most recent cycle
+            filter(cn %in% or_cond$plt_cn) %>% #Only single condition plots 
+            left_join(or_cond, by = c("cn" = "plt_cn")) %>% 
+            filter(fortypcd == 201) 
+
+df_trees <- or_fia[["tree"]] %>% 
+            filter(plt_cn %in% df_plots$cn) %>% 
+            filter(spcd == 202) %>% 
+            filter(!is.na(ht)) %>%
+            select(plt_cn, ht, bhage, tpa_unadj, cclcd)
+
+df_site_index <- df_trees %>% 
+                 group_by(plt_cn) %>% 
+                 summarise(
+                     q80 = Hmisc::wtd.quantile(ht, 0.8, weight = tpa_unadj),
+                     plot_age = round(mean(bhage, na.rm = TRUE)), #Mean plot age based on cored trees
+                     dom_ht_1 = weighted.mean(ht[cclcd %in% c(2, 3)], w = tpa_unadj[cclcd %in% c(2, 3)]), 
+                     dom_ht_2 = weighted.mean(ht[ht >= q80], w = tpa_unadj[ht >= q80]),
+                     .groups = "drop"
+                 ) %>% 
+                 gather(value = "dom_ht", key = "method", -plt_cn, -q80, -plot_age) 
+
+or_boundary <-  states() %>% filter(NAME == "Oregon")
+
+ggplot() +
+  geom_sf(data = or_boundary, fill = NA) +
+  geom_sf(data = df_plots) + 
+  theme_bw()
+
+df_site_index %>% 
+    mutate(
+        group_lab = case_when(method == "dom_ht_1" ~ "FIA CCLCD",
+                                        method == "dom_ht_2" ~ "80th quantile mean")
+    ) %>%
+    ggplot(aes(x = plot_age, y = dom_ht, col = group_lab)) + 
+    geom_point() +
+    theme_bw() +
+    xlab("plot age") +
+    ylab("dominant height (feet)")
+```
+
+After filtering down only to plots in the Douglas-fir forest type, as well as applying some other basic filters to grab a clean 
+pool of FIA data, we end with about 350 plots (Figure 1). A simple scatterplot of the two dominant height estimates vs. age (Figure 2) 
+suggests that we can expect some difference in fitted height/age curves. So, we'll go ahead and fit some basic exponential models so we can 
+compare results. 
+```{r models}
+mod_formula <- bf(dom_ht ~ exp(a + b / plot_age),
+                  a + b ~ 1,
+                  nl = TRUE)
+
+priors <- prior(normal(0, 2), nlpar = "a") +
+          prior(normal(0, 2), nlpar = "b") 
+
+model_1 <- brm(mod_formula, prior = priors, data = df_site_index %>% filter(method == "dom_ht_1"))
+model_2 <- brm(mod_formula, prior = priors, data = df_site_index %>% filter(method == "dom_ht_2"))
+
+model_1_draws <- df_site_index %>% 
+                    filter(method == "dom_ht_1") %>% 
+                    add_linpred_draws(model_1) %>% 
+                    group_by(plt_cn, plot_age, method, dom_ht) %>%
+                    summarise(
+                        dom_ht_pred = median(.value),
+                        .groups = "drop"
+                    ) 
+
+model_2_draws <- df_site_index %>% 
+                    filter(method == "dom_ht_2")  %>% 
+                    add_linpred_draws(model_2) %>% 
+                    group_by(plt_cn, plot_age, method, dom_ht) %>%
+                    summarise(
+                        dom_ht_pred = median(.value),
+                        .groups = "drop"
+                    ) 
+ 
+
+
+pred_frame <- bind_rows(model_1_draws, model_2_draws) %>% 
+              mutate(
+                  group_lab = case_when(method == "dom_ht_1" ~ "FIA CCLCD",
+                                        method == "dom_ht_2" ~ "80th quantile mean")
+              )
+
+glimpse(pred_frame)
+```
+
+```{r plot}
+
+pred_frame %>% 
+  ggplot(aes(x = plot_age, y = dom_ht))  +
+  geom_line(aes(y = dom_ht_pred, color = group_lab)) + 
+  theme_bw() +
+  theme(legend.title=element_blank()) +
+  xlab("plot age (years)") +
+  ylab("dominant height (feet)")
+
+```
+
+The results of the fitted models are shown in Figure 3. As you can see, the model fit to dominant height as estimated using the 
+80th quantile expects a much higher asymptote (around 15 feet) and generally greater dominant height predictions across much of 
+the age range. As you can see, the choice of our observation model (dominant height calculation in this case) will mean a pretty 
+big difference in our final estimates. If we were to apply these models in a management context, they'd tell pretty different 
+stories about site potential across the state of Oregon. 
+
+Of course, this is an overly simple example to make any real conclusions, but the point is that we ended up with different outcomes 
+just by changing the observation model. This is important to highlight, because as practicing biometricians we make decisions about 
+observation models all the time. Every time you select a volume table, apply a VBAR, or choose a biomass expansion factor, you're making 
+a statement about how the data you're collecting relates to the value you want to estimate. In many cases, you may have a piece of 
+software make these decisions for you! 
+
+I'm not saying this is bad; "conventional methods" become so because they're consistent and tend to work well in many contexts. 
+But I do think it's worth considering the impact of these choices. Think about the story we started off with. We saw some results 
+that didn't pass the smell test, and understanding how the "measurements" (plot estimates of dominant height) were being derived
+was critical to landing on the solution. Making sure you understand your observation model, and therefore have a clear idea of how 
+your data relate to the attributes you want to estimate, can lead to better inferences and more confident decision-making. 
+
+As always, we welcome feedback: brian@ncx.com 
+
